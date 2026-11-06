@@ -603,6 +603,7 @@ HRESULT GetShaderConvertColor(
 	const bool blendDeinterlace,
 	const bool bSdrToneMapping,
 	const bool bLinearSaturation,
+	const bool bSaturationClip,
 	ID3DBlob** ppCode)
 {
 	DLog(L"GetShaderConvertColor() started for {} {}x{} extfmt:{:#010x} chroma:{}", fmtParams.str, texW, texH, exFmt.value, chromaScaling);
@@ -820,7 +821,19 @@ HRESULT GetShaderConvertColor(
 		}
 	}
 
-	if (bLinearSaturation) {
+	if (bLinearSaturation && bSaturationClip) {
+		// Same saturation in linear light, but results outside [0, 1] are hard clipped per channel.
+		// This keeps the chroma of strongly saturated colours (hue and luminance can shift a little)
+		// and does not depend on whether the intermediate textures are integer or floating point.
+		code.append(
+			"float3 SaturateLinear(float3 lin, float s, float3 lumaW)\n"
+			"{\n"
+			"    float Y = dot(lin, lumaW);\n"
+			"    return saturate(Y + s * (lin - Y));\n"
+			"}\n"
+		);
+	}
+	else if (bLinearSaturation) {
 		// Saturation in linear light: the chrominance (RGB - Y, Y = linear luminance) is scaled and
 		// the linear luminance is left untouched. Results outside [0, 1] are pulled toward the gray
 		// of the same luminance, so hue and luminance are kept and the result does not depend on

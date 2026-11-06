@@ -72,4 +72,5 @@ HRESULT GetShaderConvertColor(
 	const bool blendDeinterlace,
 	const bool bSdrToneMapping,
 	const bool bLinearSaturation,
+	const bool bSaturationClip,
 	ID3DBlob** ppCode);

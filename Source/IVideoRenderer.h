@@ -46,7 +46,8 @@ enum :int {
 
 enum :int {
 	SATMODE_Legacy = 0,      // saturation scales U/V in the Y'CbCr -> RGB matrix (gamma domain)
-	SATMODE_LinearLight,     // saturation scales chrominance around linear-light luminance (madVR-style)
+	SATMODE_LinearLight,     // saturation scales chrominance around linear-light luminance (out-of-range colours are pulled toward gray)
+	SATMODE_LinearLightClip, // same, but out-of-range channels are hard clipped (keeps chroma, shifts hue/luminance like madVR)
 	SATMODE_COUNT
 };
 

@@ -271,6 +271,7 @@ HRESULT CVRMainPPage::OnActivate()
 
 	SendDlgItemMessageW(IDC_COMBO_SAT, CB_ADDSTRING, 0, (LPARAM)L"Legacy (Y'CbCr)");
 	SendDlgItemMessageW(IDC_COMBO_SAT, CB_ADDSTRING, 0, (LPARAM)L"Linear light");
+	SendDlgItemMessageW(IDC_COMBO_SAT, CB_ADDSTRING, 0, (LPARAM)L"Linear light (clip, madVR-like)");
 
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Nearest-neighbor");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Mitchell-Netravali");
@@ -352,8 +353,10 @@ HRESULT CVRMainPPage::OnActivate()
 	AddHint(IDC_COMBO_SAT,
 		L"Applies to the saturation control of the player.\n"
 		L"Legacy scales U/V in the Y'CbCr matrix (gamma domain).\n"
-		L"Linear light keeps the linear luminance constant, like madVR.\n"
-		L"Linear light uses the shader video processor.");
+		L"Linear light keeps the linear luminance constant.\n"
+		L"Out-of-range colours are pulled toward gray (natural).\n"
+		L"Clip: out-of-range channels are clipped (more vivid, like madVR).\n"
+		L"Both linear modes use the shader video processor.");
 	AddHint(IDC_COMBO2,
 		L"Used to increase image size when the\n"
 		"DVXA2/D3D11 Video Processor is not used for resizing.");
