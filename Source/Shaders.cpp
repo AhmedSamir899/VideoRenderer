@@ -602,6 +602,7 @@ HRESULT GetShaderConvertColor(
 	const int convertType,
 	const bool blendDeinterlace,
 	const bool bSdrToneMapping,
+	const bool bLinearSaturation,
 	ID3DBlob** ppCode)
 {
 	DLog(L"GetShaderConvertColor() started for {} {}x{} extfmt:{:#010x} chroma:{}", fmtParams.str, texW, texH, exFmt.value, chromaScaling);
@@ -678,8 +679,10 @@ HRESULT GetShaderConvertColor(
 			"float3 cm_r;\n" // NB: sizeof(float3) == sizeof(float4)
 			"float3 cm_g;\n"
 			"float3 cm_b;\n"
-			"float3 cm_c;\n"
+			"float4 cm_c4;\n" // cm_c4.a is the linear-light saturation
 			"};\n"
+			"#define cm_c cm_c4.xyz\n"
+			"#define cm_s cm_c4.a\n" // .a, not .w: "w" is a macro in this code
 		);
 		if (bConvertHDRtoSDR) {
 			code.append(
@@ -695,7 +698,9 @@ HRESULT GetShaderConvertColor(
 			"float3 cm_r : register(c0);\n"
 			"float3 cm_g : register(c1);\n"
 			"float3 cm_b : register(c2);\n"
-			"float3 cm_c : register(c3);\n"
+			"float4 cm_c4 : register(c3);\n" // cm_c4.a is the linear-light saturation
+			"#define cm_c cm_c4.xyz\n"
+			"#define cm_s cm_c4.a\n" // .a, not .w: "w" is a macro in this code
 		);
 		if (bConvertHDRtoSDR) {
 			code.append(
@@ -815,6 +820,26 @@ HRESULT GetShaderConvertColor(
 		}
 	}
 
+	if (bLinearSaturation) {
+		// Saturation in linear light: the chrominance (RGB - Y, Y = linear luminance) is scaled and
+		// the linear luminance is left untouched. Results outside [0, 1] are pulled toward the gray
+		// of the same luminance, so hue and luminance are kept and the result does not depend on
+		// whether the intermediate textures are integer or floating point.
+		code.append(
+			"float3 SaturateLinear(float3 lin, float s, float3 lumaW)\n"
+			"{\n"
+			"    float Y = dot(lin, lumaW);\n"
+			"    float3 o = Y + s * (lin - Y);\n"
+			"    float mn = min(o.r, min(o.g, o.b));\n"
+			"    float t = (mn < 0.0) ? Y / max(Y - mn, 1e-6) : 1.0;\n"
+			"    o = Y + t * (o - Y);\n"
+			"    float mx = max(o.r, max(o.g, o.b));\n"
+			"    float u = (mx > 1.0 && Y < 1.0) ? (1.0 - Y) / max(mx - Y, 1e-6) : 1.0;\n"
+			"    return Y + u * (o - Y);\n"
+			"}\n"
+		);
+	}
+
 	ShaderGetPixels(bDX11, fmtParams, exFmt.VideoChromaSubsampling, chromaScaling, blendDeinterlace, code);
 
 	if (pDoviMetadata) {
@@ -925,12 +950,32 @@ HRESULT GetShaderConvertColor(
 		}
 	}
 
+	// Linear-light saturation. The luma weights are those of BT.709: the values are sent to the display as BT.709
+	// (after the gamut conversion above, when there is one), so these weights give the luminance that is shown.
+	// Not applied to HDR that stays PQ/HLG encoded (passthrough) and to Dolby Vision that is not converted to SDR.
+	const char* const satLinearCode =
+		"if (cm_s != 1.0) {\n"
+		"    color.rgb = SaturateLinear(color.rgb, cm_s, float3(0.2126, 0.7152, 0.0722));\n"
+		"}\n";
+	const char* const satGammaCode =
+		"if (cm_s != 1.0) {\n"
+		"    float3 lin = pow(max(color.rgb, 0.0), 2.2);\n"
+		"    lin = SaturateLinear(lin, cm_s, float3(0.2126, 0.7152, 0.0722));\n"
+		"    color.rgb = pow(lin, 1.0/2.2);\n"
+		"}\n";
+	const bool bHdrEncoded = (exFmt.VideoTransferFunction == MFVideoTransFunc_2084 || exFmt.VideoTransferFunction == MFVideoTransFunc_HLG);
+
 	if (isLinear) {
 		// Linear to sRGB
-		code.append(
-			"color = saturate(color);\n"
-			"color = pow(color, 1.0/2.2);\n"
-		);
+		code.append("color = saturate(color);\n");
+		if (bLinearSaturation) {
+			code.append(satLinearCode);
+		}
+		code.append("color = pow(color, 1.0/2.2);\n");
+	}
+	else if (bLinearSaturation && !pDoviMetadata && !bConvertHLGtoPQ && !bHdrEncoded) {
+		// SDR that stays gamma encoded: 2.2 is what this renderer already assumes for SDR content above
+		code.append(satGammaCode);
 	}
 
 	code.append("return color;\n}");

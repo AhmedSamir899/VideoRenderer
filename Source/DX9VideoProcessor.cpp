@@ -275,6 +275,7 @@ CDX9VideoProcessor::CDX9VideoProcessor(CMpcVideoRenderer* pFilter, const Setting
 	m_bDeintDouble         = config.bDeintDouble;
 	m_bVPScaling           = config.bVPScaling;
 	m_iChromaScaling       = config.iChromaScaling;
+	m_iSaturationMode      = config.iSaturationMode;
 	m_iUpscaling           = config.iUpscaling;
 	m_iDownscaling         = config.iDownscaling;
 	m_bInterpolateAt50pct  = config.bInterpolateAt50pct;
@@ -858,6 +859,7 @@ HRESULT CDX9VideoProcessor::CreatePShaderFromResource(IDirect3DPixelShader9** pp
 void CDX9VideoProcessor::SetShaderConvertColorParams()
 {
 	mp_cmat cmatrix;
+	float linearSaturation = (m_iSaturationMode == SATMODE_LinearLight) ? DXVA2FixedToFloat(m_DXVA2ProcAmpValues.Saturation) : 1.0f;
 
 	if (m_Dovi.bValid) {
 		const float brightness = DXVA2FixedToFloat(m_DXVA2ProcAmpValues.Brightness) / 255;
@@ -885,6 +887,10 @@ void CDX9VideoProcessor::SetShaderConvertColorParams()
 		csp_params.contrast = DXVA2FixedToFloat(m_DXVA2ProcAmpValues.Contrast);
 		csp_params.hue = DXVA2FixedToFloat(m_DXVA2ProcAmpValues.Hue) / 180 * acos(-1);
 		csp_params.saturation = DXVA2FixedToFloat(m_DXVA2ProcAmpValues.Saturation);
+		if (m_iSaturationMode == SATMODE_LinearLight) {
+			// applied in the shader in linear light instead of in the YUV->RGB matrix
+			csp_params.saturation = 1.0f;
+		}
 		csp_params.gray = m_srcParams.CSType == CS_GRAY;
 
 		csp_params.input_bits = csp_params.texture_bits = m_srcParams.CDepth;
@@ -894,14 +900,15 @@ void CDX9VideoProcessor::SetShaderConvertColorParams()
 		m_PSConvColorData.bEnable =
 			m_srcParams.CSType == CS_YUV ||
 			m_srcParams.cformat == CF_GBRP8 || m_srcParams.cformat == CF_GBRP10 || m_srcParams.cformat == CF_GBRP16 ||
-			fabs(csp_params.brightness) > 1e-4f || fabs(csp_params.contrast - 1.0f) > 1e-4f;
+			fabs(csp_params.brightness) > 1e-4f || fabs(csp_params.contrast - 1.0f) > 1e-4f ||
+			fabs(linearSaturation - 1.0f) > 1e-4f;
 	}
 
 	m_PSConvColorData.Constants = {
 		{cmatrix.m[0][0], cmatrix.m[0][1], cmatrix.m[0][2], 0},
 		{cmatrix.m[1][0], cmatrix.m[1][1], cmatrix.m[1][2], 0},
 		{cmatrix.m[2][0], cmatrix.m[2][1], cmatrix.m[2][2], 0},
-		{cmatrix.c[0],    cmatrix.c[1],    cmatrix.c[2],    0},
+		{cmatrix.c[0],    cmatrix.c[1],    cmatrix.c[2],    linearSaturation},
 	};
 
 	auto& cbuffer = m_PSConvColorData.Constants;
@@ -1195,6 +1202,10 @@ BOOL CDX9VideoProcessor::InitMediaType(const CMediaType* pmt)
 	default:      disableDXVA2 = !m_VPFormats.bOther; break;
 	}
 	if (m_srcExFmt.VideoTransferMatrix == VIDEOTRANSFERMATRIX_YCgCo || m_Dovi.bValid) {
+		disableDXVA2 = true;
+	}
+	if (m_iSaturationMode == SATMODE_LinearLight && FmtParams.D3DFormat != D3DFMT_UNKNOWN) {
+		// DXVA2 applies saturation in the driver, so the shader video processor is needed
 		disableDXVA2 = true;
 	}
 	if (disableDXVA2) {
@@ -2005,6 +2016,11 @@ void CDX9VideoProcessor::Configure(const Settings_t& config)
 		changeVP = true; // temporary solution
 	}
 
+	if (config.iSaturationMode != m_iSaturationMode) {
+		m_iSaturationMode = config.iSaturationMode;
+		changeVP = true; // the linear-light mode needs the shader video processor
+	}
+
 	if (config.iChromaScaling != m_iChromaScaling) {
 		m_iChromaScaling = config.iChromaScaling;
 		changeConvertShader = m_PSConvColorData.bEnable && (m_srcParams.Subsampling == 420 || m_srcParams.Subsampling == 422);
@@ -2319,7 +2335,7 @@ HRESULT CDX9VideoProcessor::UpdateConvertColorShader()
 			m_srcWidth,
 			m_TexSrcVideo.Width, m_TexSrcVideo.Height,
 			m_srcRect, m_srcParams, m_srcExFmt, pDOVIMetadata,
-			m_iChromaScaling, convertType, false, m_bSdrToneMapping,
+			m_iChromaScaling, convertType, false, m_bSdrToneMapping, m_iSaturationMode == SATMODE_LinearLight,
 			&pShaderCode);
 		if (S_OK == hr) {
 			hr = m_pD3DDevEx->CreatePixelShader((const DWORD*)pShaderCode->GetBufferPointer(), &m_pPSConvertColor);
@@ -2331,7 +2347,7 @@ HRESULT CDX9VideoProcessor::UpdateConvertColorShader()
 				m_srcWidth,
 				m_TexSrcVideo.Width, m_TexSrcVideo.Height,
 				m_srcRect, m_srcParams, m_srcExFmt, pDOVIMetadata,
-				m_iChromaScaling, convertType, true, m_bSdrToneMapping,
+				m_iChromaScaling, convertType, true, m_bSdrToneMapping, m_iSaturationMode == SATMODE_LinearLight,
 				&pShaderCode);
 			if (S_OK == hr) {
 				hr = m_pD3DDevEx->CreatePixelShader((const DWORD*)pShaderCode->GetBufferPointer(), &m_pPSConvertColorDeint);

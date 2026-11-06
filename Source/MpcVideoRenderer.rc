@@ -113,6 +113,8 @@ BEGIN
     CONTROL         "Adjust the frame presentation time",IDC_CHECK13,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,178,217,133,10
     CONTROL         "Reinitialize device when changing display",IDC_CHECK16,
                     "Button",BS_AUTOCHECKBOX | WS_TABSTOP,178,230,151,10
+    LTEXT           "Saturation:",IDC_STATIC_SAT,178,246,45,8
+    COMBOBOX        IDC_COMBO_SAT,226,244,76,30,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     PUSHBUTTON      "Default",IDC_BUTTON1,305,243,37,14
     EDITTEXT        IDC_EDIT2,76,262,266,12,ES_READONLY | NOT WS_BORDER,WS_EX_RIGHT
 END

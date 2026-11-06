@@ -93,6 +93,7 @@ protected:
 	bool m_bDeintDouble                    = true;
 	bool m_bVPScaling                      = true;
 	int  m_iChromaScaling                  = CHROMA_Bilinear;
+	int  m_iSaturationMode                 = SATMODE_Legacy;
 	int  m_iUpscaling                      = UPSCALE_CatmullRom; // interpolation
 	int  m_iDownscaling                    = DOWNSCALE_Hamming;  // convolution
 	bool m_bInterpolateAt50pct             = true;

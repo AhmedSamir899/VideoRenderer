@@ -45,6 +45,12 @@ enum :int {
 };
 
 enum :int {
+	SATMODE_Legacy = 0,      // saturation scales U/V in the Y'CbCr -> RGB matrix (gamma domain)
+	SATMODE_LinearLight,     // saturation scales chrominance around linear-light luminance (madVR-style)
+	SATMODE_COUNT
+};
+
+enum :int {
 	CHROMA_Nearest = 0,
 	CHROMA_Bilinear,
 	CHROMA_CatmullRom,
@@ -154,6 +160,7 @@ struct Settings_t {
 	bool bHdrLocalMeasurePeak;
 	int  iHdrDoviToneMappingType; // 6 = ST 2094-10, 0 = the HDR method
 	int iHdrDisplayMaxNits;
+	int iSaturationMode;
 
 	Settings_t() {
 		SetDefault();
@@ -212,6 +219,7 @@ struct Settings_t {
 		bSdrPeakSceneCuts               = false;
 		iHdrOsdBrightness               = 0;
 		iSDRDisplayNits                 = SDR_NITS_DEF;
+		iSaturationMode                 = SATMODE_Legacy;
 	}
 };
 

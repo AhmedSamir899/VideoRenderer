@@ -130,6 +130,7 @@ void CVRMainPPage::SetControls()
 	SendDlgItemMessageW(IDC_COMBO6, CB_SETCURSEL, m_SetsPP.iResizeStats, 0);
 
 	SendDlgItemMessageW(IDC_COMBO5, CB_SETCURSEL, m_SetsPP.iChromaScaling, 0);
+	SendDlgItemMessageW(IDC_COMBO_SAT, CB_SETCURSEL, m_SetsPP.iSaturationMode, 0);
 	SendDlgItemMessageW(IDC_COMBO2, CB_SETCURSEL, m_SetsPP.iUpscaling, 0);
 	SendDlgItemMessageW(IDC_COMBO3, CB_SETCURSEL, m_SetsPP.iDownscaling, 0);
 	SendDlgItemMessageW(IDC_COMBO4, CB_SETCURSEL, m_SetsPP.iSwapEffect, 0);
@@ -268,6 +269,9 @@ HRESULT CVRMainPPage::OnActivate()
 	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"Bilinear");
 	SendDlgItemMessageW(IDC_COMBO5, CB_ADDSTRING, 0, (LPARAM)L"Catmull-Rom");
 
+	SendDlgItemMessageW(IDC_COMBO_SAT, CB_ADDSTRING, 0, (LPARAM)L"Legacy (Y'CbCr)");
+	SendDlgItemMessageW(IDC_COMBO_SAT, CB_ADDSTRING, 0, (LPARAM)L"Linear light");
+
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Nearest-neighbor");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Mitchell-Netravali");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Catmull-Rom");
@@ -345,6 +349,11 @@ HRESULT CVRMainPPage::OnActivate()
 	AddHint(IDC_COMBO5,
 		L"Used for YUV 4:2:0/4:2:2 input formats\n"
 		"when the DVXA2/D3D11 Video Processor is not active.");
+	AddHint(IDC_COMBO_SAT,
+		L"Applies to the saturation control of the player.\n"
+		L"Legacy scales U/V in the Y'CbCr matrix (gamma domain).\n"
+		L"Linear light keeps the linear luminance constant, like madVR.\n"
+		L"Linear light uses the shader video processor.");
 	AddHint(IDC_COMBO2,
 		L"Used to increase image size when the\n"
 		"DVXA2/D3D11 Video Processor is not used for resizing.");
@@ -526,6 +535,14 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				lValue = SendDlgItemMessageW(IDC_COMBO5, CB_GETCURSEL, 0, 0);
 				if (lValue != m_SetsPP.iChromaScaling) {
 					m_SetsPP.iChromaScaling = lValue;
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO_SAT) {
+				lValue = SendDlgItemMessageW(IDC_COMBO_SAT, CB_GETCURSEL, 0, 0);
+				if (lValue != m_SetsPP.iSaturationMode) {
+					m_SetsPP.iSaturationMode = lValue;
 					SetDirty();
 				}
 				return (LRESULT)1;
