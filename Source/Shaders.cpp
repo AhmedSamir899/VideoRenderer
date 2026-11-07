@@ -835,9 +835,12 @@ HRESULT GetShaderConvertColor(
 	}
 	else if (bLinearSaturation) {
 		// Saturation in linear light: the chrominance (RGB - Y, Y = linear luminance) is scaled and
-		// the linear luminance is left untouched. Results outside [0, 1] are pulled toward the gray
-		// of the same luminance, so hue and luminance are kept and the result does not depend on
-		// whether the intermediate textures are integer or floating point.
+		// the linear luminance is left untouched. A channel that would go below 0 is handled by pulling
+		// the colour toward the gray of the same luminance, which keeps the hue (a saturated green stays
+		// that green). A channel above 1 is simply clipped: pulling toward gray there divides by a value
+		// that gets small near white, which amplifies tiny differences between neighbouring pixels and
+		// frames into visible noise (measured on tone mapped HDR). The result does not depend on whether
+		// the intermediate textures are integer or floating point.
 		code.append(
 			"float3 SaturateLinear(float3 lin, float s, float3 lumaW)\n"
 			"{\n"
@@ -845,10 +848,7 @@ HRESULT GetShaderConvertColor(
 			"    float3 o = Y + s * (lin - Y);\n"
 			"    float mn = min(o.r, min(o.g, o.b));\n"
 			"    float t = (mn < 0.0) ? Y / max(Y - mn, 1e-6) : 1.0;\n"
-			"    o = Y + t * (o - Y);\n"
-			"    float mx = max(o.r, max(o.g, o.b));\n"
-			"    float u = (mx > 1.0 && Y < 1.0) ? (1.0 - Y) / max(mx - Y, 1e-6) : 1.0;\n"
-			"    return Y + u * (o - Y);\n"
+			"    return saturate(Y + t * (o - Y));\n"
 			"}\n"
 		);
 	}
