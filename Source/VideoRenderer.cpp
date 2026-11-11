@@ -49,6 +49,7 @@
 #define OPT_VPRTXVideoHDR                  L"VPRTXVideoHDR"
 #define OPT_ChromaUpsampling               L"ChromaUpsampling"
 #define OPT_SaturationMode                 L"SaturationMode"
+#define OPT_DebandStrength                 L"DebandStrength"
 #define OPT_Upscaling                      L"Upscaling"
 #define OPT_Downscaling                    L"Downscaling"
 #define OPT_InterpolateAt50pct             L"InterpolateAt50pct"
@@ -242,6 +243,9 @@ CMpcVideoRenderer::CMpcVideoRenderer(LPUNKNOWN pUnk, HRESULT* phr)
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_SaturationMode, dw)) {
 			m_Sets.iSaturationMode = discard<int>(dw, SATMODE_Legacy, 0, SATMODE_COUNT-1);
+		}
+		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_DebandStrength, dw)) {
+			m_Sets.iDebandStrength = discard<int>(dw, DEBAND_Off, 0, DEBAND_COUNT-1);
 		}
 		if (ERROR_SUCCESS == key.QueryDWORDValue(OPT_Upscaling, dw)) {
 			m_Sets.iUpscaling = discard<int>(dw, UPSCALE_CatmullRom, 0, UPSCALE_COUNT-1);
@@ -1341,6 +1345,7 @@ STDMETHODIMP CMpcVideoRenderer::SaveSettings()
 #endif
 		key.SetDWORDValue(OPT_ChromaUpsampling,    m_Sets.iChromaScaling);
 		key.SetDWORDValue(OPT_SaturationMode,      m_Sets.iSaturationMode);
+		key.SetDWORDValue(OPT_DebandStrength,      m_Sets.iDebandStrength);
 		key.SetDWORDValue(OPT_Upscaling,           m_Sets.iUpscaling);
 		key.SetDWORDValue(OPT_Downscaling,         m_Sets.iDownscaling);
 		key.SetDWORDValue(OPT_InterpolateAt50pct,  m_Sets.bInterpolateAt50pct);

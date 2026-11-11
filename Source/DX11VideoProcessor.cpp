@@ -117,6 +117,16 @@ struct VERTEX {
 	DirectX::XMFLOAT2 TexCoord;
 };
 
+struct PS_DEBAND_CONSTANTS {
+	float clampRect[4];   // min x, min y, max x, max y (pixels, inclusive)
+	float threshold;
+	float radius;
+	float grain;
+	uint32_t seed;
+	int32_t iterations;
+	float pad[3];
+};
+
 struct PS_EXTSHADER_CONSTANTS {
 	DirectX::XMFLOAT2 pxy; // pixel size in normalized coordinates
 	DirectX::XMFLOAT2 wh;  // width and height of texture
@@ -393,6 +403,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_bVPRTXVideoHDR       = config.bVPRTXVideoHDR;
 	m_iChromaScaling       = config.iChromaScaling;
 	m_iSaturationMode      = config.iSaturationMode;
+	m_iDebandStrength      = config.iDebandStrength;
 	m_iUpscaling           = config.iUpscaling;
 	m_iDownscaling         = config.iDownscaling;
 	m_bInterpolateAt50pct  = config.bInterpolateAt50pct;
@@ -683,6 +694,7 @@ void CDX11VideoProcessor::ReleaseVP()
 	m_TexSrcVideo.Release();
 	m_TexConvertOutput.Release();
 	m_TexResize.Release();
+	m_TexDeband.Release();
 	m_TexsPostScale.Release();
 
 	m_PSConvColorData.Release();
@@ -748,6 +760,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pVSimpleInputLayout.Release();
 	m_pVS_Simple.Release();
 	m_pPS_Simple.Release();
+	m_pPSDeband.Release();
+	m_pDebandConstants.Release();
 	m_pPS_BitmapToFrame.Release();
 	m_pSamplerPoint.Release();
 	m_pSamplerLinear.Release();
@@ -1638,6 +1652,7 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateInputLayout(Layout, std::size(Layout), data, size, &m_pVSimpleInputLayout));
 
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPS_Simple, IDF_PS_11_SIMPLE));
+	CreatePShaderFromResource(&m_pPSDeband, IDF_PS_11_DEBAND); // optional: without it the debanding stays off
 
 #if TEST_SHADER
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPS_TEST, IDF_PS_11_TEST));
@@ -1655,6 +1670,9 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	BufferDesc = { sizeof(PS_EXTSHADER_CONSTANTS), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
 	EXECUTE_ASSERT(S_OK == m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pPostScaleConstants));
+
+	BufferDesc = { sizeof(PS_DEBAND_CONSTANTS), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+	m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pDebandConstants);
 
 	CComPtr<IDXGIFactory1> pDXGIFactory1;
 	hr = pDXGIAdapter->GetParent(IID_PPV_ARGS(&pDXGIFactory1));
@@ -3681,6 +3699,81 @@ void CDX11VideoProcessor::DrawSubtitles(ID3D11Texture2D* pRenderTarget)
 	}
 }
 
+bool CDX11VideoProcessor::IsDebandActive() const
+{
+	if (m_iDebandStrength <= DEBAND_Off || !m_pPSDeband || !m_pDebandConstants) {
+		return false;
+	}
+
+	// not for HDR that stays PQ/HLG encoded: the thresholds are meant for SDR gamma encoded values
+	if (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)) {
+		return false;
+	}
+	if (!m_bConvertToSdr
+			&& (m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_2084 || m_srcExFmt.VideoTransferFunction == MFVideoTransFunc_HLG)) {
+		return false;
+	}
+
+	return true;
+}
+
+// Debanding at the source resolution, after the color conversion and before the scaling.
+// On success pInputTexture points to the debanded texture (same size as the input).
+HRESULT CDX11VideoProcessor::DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect)
+{
+	const UINT width  = pInputTexture->desc.Width;
+	const UINT height = pInputTexture->desc.Height;
+
+	HRESULT hr = m_TexDeband.CheckCreate(m_pDevice, m_InternalTexFmt, width, height, Tex2D_DefaultShaderRTarget);
+	if (FAILED(hr)) {
+		return hr;
+	}
+
+	struct Preset { float threshold; float radius; int32_t iterations; };
+	static const Preset presets[] = {
+		{0.0f,         0.0f, 0}, // Off
+		{2.0f / 255,  16.0f, 1}, // Low
+		{3.5f / 255,  20.0f, 2}, // Medium
+		{6.0f / 255,  24.0f, 3}, // High
+	};
+	const Preset& preset = presets[std::clamp(m_iDebandStrength, 1, 3)];
+
+	// noise amplitude: about one code value of the intermediate texture
+	float grain = 0.5f / 255; // 16-bit float: the final pass dithers to the output depth
+	if (m_InternalTexFmt == DXGI_FORMAT_B8G8R8A8_UNORM || m_InternalTexFmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+		grain = 1.0f / 255;
+	}
+	else if (m_InternalTexFmt == DXGI_FORMAT_R10G10B10A2_UNORM) {
+		grain = 1.0f / 1023;
+	}
+
+	const PS_DEBAND_CONSTANTS constants = {
+		{ (float)srcRect.left, (float)srcRect.top, (float)(srcRect.right - 1), (float)(srcRect.bottom - 1) },
+		preset.threshold,
+		preset.radius,
+		grain,
+		m_DebandFrame++,
+		preset.iterations,
+		{ 0, 0, 0 }
+	};
+
+	D3D11_MAPPED_SUBRESOURCE mr;
+	hr = m_pDeviceContext->Map(m_pDebandConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mr);
+	if (FAILED(hr)) {
+		return hr;
+	}
+	memcpy(mr.pData, &constants, sizeof(constants));
+	m_pDeviceContext->Unmap(m_pDebandConstants, 0);
+
+	const CRect rect(0, 0, width, height);
+	hr = TextureCopyRect(*pInputTexture, m_TexDeband.pTexture, rect, rect, m_pPSDeband, m_pDebandConstants, 0, false);
+	if (SUCCEEDED(hr)) {
+		pInputTexture = &m_TexDeband;
+	}
+
+	return hr;
+}
+
 HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect, const bool second)
 {
 	HRESULT hr = S_OK;
@@ -3691,6 +3784,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	Tex2D_t* pInputTexture = nullptr;
 
 	const UINT numSteps = GetPostScaleSteps();
+	const bool bDeband = IsDebandActive();
 
 	if (m_D3D11VP.IsReady()) {
 		if (!(m_iSwapEffect == SWAPEFFECT_Discard && (m_VendorId == PCIV_AMDATI || m_VendorId == PCIV_INTEL))) {
@@ -3698,7 +3792,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				(m_TexConvertOutput.desc.Width != dstRect.Width() || m_TexConvertOutput.desc.Height != dstRect.Height() || m_bFlip
 				|| dstRect.right > m_windowRect.right || dstRect.bottom > m_windowRect.bottom)
 				|| (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)); // At least on Nvidia we can sometimes get the "D3D11: Removing Device" error here when HDR Passthrough.
-			if (!bNeedShaderTransform && !numSteps) {
+			if (!bNeedShaderTransform && !numSteps && !bDeband) {
 				m_bVPScalingUseShaders = false;
 				hr = D3D11VPPass(pRenderTarget, rSrc, dstRect, second);
 
@@ -3719,6 +3813,10 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	}
 	else {
 		pInputTexture = &m_TexSrcVideo;
+	}
+
+	if (bDeband) {
+		DebandPass(pInputTexture, rSrc); // on failure the picture continues without debanding
 	}
 
 	if (numSteps) {
@@ -4282,6 +4380,8 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		m_iSaturationMode = config.iSaturationMode;
 		changeVP = true; // the linear-light mode needs the shader video processor
 	}
+
+	m_iDebandStrength = config.iDebandStrength; // takes effect on the next rendered frame
 
 	if (config.iChromaScaling != m_iChromaScaling) {
 		m_iChromaScaling = config.iChromaScaling;

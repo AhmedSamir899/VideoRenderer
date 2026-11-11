@@ -81,6 +81,7 @@ IDF_PS_11_FIXCONVERT_PQ_TO_SDR  FILE                    "..\\_bin\\shaders\\ps_f
 IDF_PS_11_CONVERT_PQ_TO_SDR_TM  FILE                    "..\\_bin\\shaders\\ps_convert_pq_to_sdr_tonemap.cso"
 IDF_PS_11_FIXCONVERT_PQ_TO_SDR_TM FILE                    "..\\_bin\\shaders\\ps_fixconvert_pq_to_sdr_tonemap.cso"
 IDF_PS_11_FIXCONVERT_HLG_TO_SDR_TM FILE                    "..\\_bin\\shaders\\ps_fixconvert_hlg_to_sdr_tonemap.cso"
+IDF_PS_11_DEBAND                FILE                    "..\\_bin\\shaders\\ps_deband.cso"
 IDF_PS_11_CONVERT_PQ_TO_SDR_TM_MEASURED FILE                    "..\\_bin\\shaders\\ps_convert_pq_to_sdr_tonemap_measured.cso"
 IDF_PS_11_FIXCONVERT_PQ_TO_SDR_TM_MEASURED FILE                    "..\\_bin\\shaders\\ps_fixconvert_pq_to_sdr_tonemap_measured.cso"
 IDF_CS_11_HDR_HIST              FILE                    "..\\_bin\\shaders\\cs_hdr_hist.cso"

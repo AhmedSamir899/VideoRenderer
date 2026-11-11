@@ -52,6 +52,14 @@ enum :int {
 };
 
 enum :int {
+	DEBAND_Off = 0,
+	DEBAND_Low,
+	DEBAND_Medium,
+	DEBAND_High,
+	DEBAND_COUNT
+};
+
+enum :int {
 	CHROMA_Nearest = 0,
 	CHROMA_Bilinear,
 	CHROMA_CatmullRom,
@@ -162,6 +170,7 @@ struct Settings_t {
 	int  iHdrDoviToneMappingType; // 6 = ST 2094-10, 0 = the HDR method
 	int iHdrDisplayMaxNits;
 	int iSaturationMode;
+	int iDebandStrength;
 
 	Settings_t() {
 		SetDefault();
@@ -221,6 +230,7 @@ struct Settings_t {
 		iHdrOsdBrightness               = 0;
 		iSDRDisplayNits                 = SDR_NITS_DEF;
 		iSaturationMode                 = SATMODE_Legacy;
+		iDebandStrength                 = DEBAND_Off;
 	}
 };
 

@@ -125,6 +125,10 @@
       <ShaderModel>4.0</ShaderModel>
       <ShaderType>Pixel</ShaderType>
     </FxCompile>
+    <FxCompile Include="d3d11\ps_deband.hlsl">
+      <ShaderModel>4.0</ShaderModel>
+      <ShaderType>Pixel</ShaderType>
+    </FxCompile>
     <FxCompile Include="d3d11\ps_font.hlsl">
       <ShaderModel>4.0</ShaderModel>
       <ShaderType>Pixel</ShaderType>
