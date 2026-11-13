@@ -171,6 +171,7 @@ struct Settings_t {
 	int iHdrDisplayMaxNits;
 	int iSaturationMode;
 	int iDebandStrength;
+	int iDebandFadeStrength; // 0 = same as iDebandStrength, otherwise DEBAND_Low..DEBAND_High (used while a fade is detected)
 
 	Settings_t() {
 		SetDefault();
@@ -231,6 +232,7 @@ struct Settings_t {
 		iSDRDisplayNits                 = SDR_NITS_DEF;
 		iSaturationMode                 = SATMODE_Legacy;
 		iDebandStrength                 = DEBAND_Off;
+		iDebandFadeStrength             = 0;
 	}
 };
 

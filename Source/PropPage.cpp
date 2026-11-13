@@ -132,6 +132,7 @@ void CVRMainPPage::SetControls()
 	SendDlgItemMessageW(IDC_COMBO5, CB_SETCURSEL, m_SetsPP.iChromaScaling, 0);
 	SendDlgItemMessageW(IDC_COMBO_SAT, CB_SETCURSEL, m_SetsPP.iSaturationMode, 0);
 	SendDlgItemMessageW(IDC_COMBO_DEBAND, CB_SETCURSEL, m_SetsPP.iDebandStrength, 0);
+	SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_SETCURSEL, m_SetsPP.iDebandFadeStrength, 0);
 	SendDlgItemMessageW(IDC_COMBO2, CB_SETCURSEL, m_SetsPP.iUpscaling, 0);
 	SendDlgItemMessageW(IDC_COMBO3, CB_SETCURSEL, m_SetsPP.iDownscaling, 0);
 	SendDlgItemMessageW(IDC_COMBO4, CB_SETCURSEL, m_SetsPP.iSwapEffect, 0);
@@ -171,6 +172,8 @@ void CVRMainPPage::EnableControls()
 
 	GetDlgItem(IDC_STATIC_DEBAND).EnableWindow(m_SetsPP.bUseD3D11);
 	GetDlgItem(IDC_COMBO_DEBAND).EnableWindow(m_SetsPP.bUseD3D11);
+	GetDlgItem(IDC_STATIC_DEBAND_FADE).EnableWindow(m_SetsPP.bUseD3D11);
+	GetDlgItem(IDC_COMBO_DEBAND_FADE).EnableWindow(m_SetsPP.bUseD3D11);
 	GetDlgItem(IDC_STATIC_SDRTM).EnableWindow(m_SetsPP.bConvertToSdr);
 	GetDlgItem(IDC_COMBO_SDRTM).EnableWindow(m_SetsPP.bConvertToSdr);
 	GetDlgItem(IDC_STATIC8).EnableWindow(m_SetsPP.bConvertToSdr);
@@ -281,6 +284,11 @@ HRESULT CVRMainPPage::OnActivate()
 	SendDlgItemMessageW(IDC_COMBO_DEBAND, CB_ADDSTRING, 0, (LPARAM)L"Medium");
 	SendDlgItemMessageW(IDC_COMBO_DEBAND, CB_ADDSTRING, 0, (LPARAM)L"High");
 
+	SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_ADDSTRING, 0, (LPARAM)L"Same");
+	SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_ADDSTRING, 0, (LPARAM)L"Low");
+	SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_ADDSTRING, 0, (LPARAM)L"Medium");
+	SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_ADDSTRING, 0, (LPARAM)L"High");
+
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Nearest-neighbor");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Mitchell-Netravali");
 	SendDlgItemMessageW(IDC_COMBO2, CB_ADDSTRING, 0, (LPARAM)L"Catmull-Rom");
@@ -370,6 +378,11 @@ HRESULT CVRMainPPage::OnActivate()
 		L"Runs on the picture before scaling, with the shader video processor.\n"
 		L"Real edges are kept. Higher strength smooths wider bands\n"
 		L"but can soften very fine texture. Direct3D 11 only.");
+	AddHint(IDC_COMBO_DEBAND_FADE,
+		L"Debanding strength while a fade in/out is detected.\n"
+		L"Fades make banding most visible. 'Same' uses the normal strength\n"
+		L"and turns the fade detection off.\n"
+		L"The detection needs about 3 frames to react. Direct3D 11 only.");
 	AddHint(IDC_COMBO2,
 		L"Used to increase image size when the\n"
 		"DVXA2/D3D11 Video Processor is not used for resizing.");
@@ -567,6 +580,14 @@ INT_PTR CVRMainPPage::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPAR
 				lValue = SendDlgItemMessageW(IDC_COMBO_DEBAND, CB_GETCURSEL, 0, 0);
 				if (lValue != m_SetsPP.iDebandStrength) {
 					m_SetsPP.iDebandStrength = lValue;
+					SetDirty();
+				}
+				return (LRESULT)1;
+			}
+			if (nID == IDC_COMBO_DEBAND_FADE) {
+				lValue = SendDlgItemMessageW(IDC_COMBO_DEBAND_FADE, CB_GETCURSEL, 0, 0);
+				if (lValue != m_SetsPP.iDebandFadeStrength) {
+					m_SetsPP.iDebandFadeStrength = lValue;
 					SetDirty();
 				}
 				return (LRESULT)1;

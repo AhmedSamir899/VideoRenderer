@@ -71,6 +71,17 @@ private:
 	Tex2D_t m_TexConvertOutput;
 	Tex2D_t m_TexResize;        // for intermediate result of two-pass resize
 	Tex2D_t m_TexDeband;        // result of the debanding pass
+	Tex2D_t m_TexFadeSmall;     // small copy of the frame for the fade detection
+	CComPtr<ID3D11Texture2D> m_pFadeStaging[3]; // CPU readable copies, read two frames later to avoid stalling the GPU
+	std::vector<float> m_FadePrevLuma;
+	std::vector<float> m_FadeCurLuma;
+	std::vector<float> m_FadeDiff;
+	UINT m_FadeFrame      = 0;
+	bool m_FadePrevValid  = false;
+	int  m_FadeCount      = 0;
+	int  m_FadeSign       = 0;
+	int  m_FadeMiss       = 0;
+	bool m_bFadeActive    = false;
 	CTex2DRing m_TexsPostScale;
 	Tex2D_t m_TexDither;
 
@@ -396,7 +407,9 @@ private:
 	HRESULT D3D11VPPass(ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect, const bool second);
 	HRESULT ConvertColorPass(ID3D11Texture2D* pRenderTarget);
 	bool IsDebandActive() const;
-	HRESULT DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect);
+	HRESULT DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect, const int strength);
+	void ResetFadeDetection();
+	void UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect);
 	HRESULT ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect, const int rotation);
 	HRESULT FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect);
 

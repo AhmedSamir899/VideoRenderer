@@ -24,6 +24,9 @@
 #include <Mfidl.h>
 #include <optional>
 #include <limits>
+#include <algorithm>
+#include <vector>
+#include <cmath>
 #include "Helper.h"
 #include "Times.h"
 #include "resource.h"
@@ -404,6 +407,7 @@ CDX11VideoProcessor::CDX11VideoProcessor(CMpcVideoRenderer* pFilter, const Setti
 	m_iChromaScaling       = config.iChromaScaling;
 	m_iSaturationMode      = config.iSaturationMode;
 	m_iDebandStrength      = config.iDebandStrength;
+	m_iDebandFadeStrength  = config.iDebandFadeStrength;
 	m_iUpscaling           = config.iUpscaling;
 	m_iDownscaling         = config.iDownscaling;
 	m_bInterpolateAt50pct  = config.bInterpolateAt50pct;
@@ -695,6 +699,11 @@ void CDX11VideoProcessor::ReleaseVP()
 	m_TexConvertOutput.Release();
 	m_TexResize.Release();
 	m_TexDeband.Release();
+	m_TexFadeSmall.Release();
+	for (auto& tex : m_pFadeStaging) {
+		tex.Release();
+	}
+	ResetFadeDetection();
 	m_TexsPostScale.Release();
 
 	m_PSConvColorData.Release();
@@ -3701,7 +3710,7 @@ void CDX11VideoProcessor::DrawSubtitles(ID3D11Texture2D* pRenderTarget)
 
 bool CDX11VideoProcessor::IsDebandActive() const
 {
-	if (m_iDebandStrength <= DEBAND_Off || !m_pPSDeband || !m_pDebandConstants) {
+	if ((m_iDebandStrength <= DEBAND_Off && m_iDebandFadeStrength <= 0) || !m_pPSDeband || !m_pDebandConstants) {
 		return false;
 	}
 
@@ -3717,9 +3726,176 @@ bool CDX11VideoProcessor::IsDebandActive() const
 	return true;
 }
 
+// Fade detection. A small copy of every frame is read back (two frames later, so the GPU is never waited for)
+// and compared with the previous one. In a fade in/out or to/from white, the new frame is the old one with a
+// changed brightness: every pixel follows new = a * old + b with a small error, the mean brightness moves in one
+// direction and most pixels move with it. Scene cuts, camera motion and moving objects do not fit this.
+static constexpr UINT  FADE_W            = 128;
+static constexpr UINT  FADE_H            = 72;
+static constexpr float FADE_MIN_STD      = 0.012f; // the picture needs some content (standard deviation of the luma)
+static constexpr float FADE_RES_RATIO    = 0.25f;  // allowed error of the fit relative to the picture contrast
+static constexpr float FADE_RES_ABS      = 0.004f; // ... plus this much (noise)
+static constexpr float FADE_MIN_DELTA    = 0.0004f; // minimal change of the mean luma between frames
+static constexpr float FADE_MIN_CHANGE   = 0.004f; // minimal |a - 1| + |b|
+static constexpr float FADE_MEDIAN_RATIO = 0.3f;   // the median change must follow the mean change (global change)
+static constexpr int   FADE_NEED         = 3;      // consecutive matching frames to start
+static constexpr int   FADE_MAX_MISS     = 2;      // consecutive non matching frames to stop
+
+void CDX11VideoProcessor::ResetFadeDetection()
+{
+	m_FadeFrame     = 0;
+	m_FadePrevValid = false;
+	m_FadeCount     = 0;
+	m_FadeSign      = 0;
+	m_FadeMiss      = 0;
+	m_bFadeActive   = false;
+}
+
+void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect)
+{
+	HRESULT hr = m_TexFadeSmall.CheckCreate(m_pDevice, DXGI_FORMAT_B8G8R8A8_UNORM, FADE_W, FADE_H, Tex2D_DefaultShaderRTarget);
+	if (FAILED(hr)) {
+		return;
+	}
+
+	if (!m_pFadeStaging[0]) {
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width            = FADE_W;
+		desc.Height           = FADE_H;
+		desc.MipLevels        = 1;
+		desc.ArraySize        = 1;
+		desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Usage            = D3D11_USAGE_STAGING;
+		desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+		for (auto& tex : m_pFadeStaging) {
+			if (FAILED(m_pDevice->CreateTexture2D(&desc, nullptr, &tex))) {
+				for (auto& t : m_pFadeStaging) {
+					t.Release();
+				}
+				return;
+			}
+		}
+	}
+
+	hr = TextureCopyRect(*pInputTexture, m_TexFadeSmall.pTexture, srcRect, CRect(0, 0, FADE_W, FADE_H), m_pPS_Simple, nullptr, 0, false);
+	if (FAILED(hr)) {
+		return;
+	}
+
+	m_pDeviceContext->CopyResource(m_pFadeStaging[m_FadeFrame % 3], m_TexFadeSmall.pTexture);
+	m_FadeFrame++;
+	if (m_FadeFrame < 3) {
+		return;
+	}
+
+	// the copy made two frames ago (m_FadeFrame - 3 is in the same slot as m_FadeFrame % 3)
+	D3D11_MAPPED_SUBRESOURCE mr;
+	hr = m_pDeviceContext->Map(m_pFadeStaging[m_FadeFrame % 3], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mr);
+	if (hr != S_OK) {
+		m_FadePrevValid = false; // not ready: the sequence of frames is broken
+		return;
+	}
+
+	constexpr size_t n = (size_t)FADE_W * FADE_H;
+	m_FadeCurLuma.resize(n);
+	for (UINT y = 0; y < FADE_H; y++) {
+		const BYTE* row = (const BYTE*)mr.pData + (size_t)y * mr.RowPitch;
+		float* dst = &m_FadeCurLuma[(size_t)y * FADE_W];
+		for (UINT x = 0; x < FADE_W; x++) {
+			const float b = row[4 * x + 0];
+			const float g = row[4 * x + 1];
+			const float r = row[4 * x + 2];
+			dst[x] = (0.2126f * r + 0.7152f * g + 0.0722f * b) / 255.0f;
+		}
+	}
+	m_pDeviceContext->Unmap(m_pFadeStaging[m_FadeFrame % 3], 0);
+
+	if (m_FadePrevValid && m_FadePrevLuma.size() == n) {
+		const std::vector<float>& prev = m_FadePrevLuma;
+		const std::vector<float>& cur  = m_FadeCurLuma;
+
+		double mp = 0, mc = 0;
+		for (size_t i = 0; i < n; i++) {
+			mp += prev[i];
+			mc += cur[i];
+		}
+		mp /= n;
+		mc /= n;
+
+		double vp = 0, vc = 0, cov = 0;
+		for (size_t i = 0; i < n; i++) {
+			const double dp = prev[i] - mp;
+			const double dc = cur[i] - mc;
+			vp  += dp * dp;
+			vc  += dc * dc;
+			cov += dp * dc;
+		}
+		vp /= n;
+		vc /= n;
+		cov /= n;
+		const double sp = std::sqrt(vp);
+		const double sc = std::sqrt(vc);
+
+		double a = 1.0, b = 0.0, res = 1.0;
+		if (vp > 1e-9) {
+			a = cov / vp;
+			b = mc - a * mp;
+			double rs = 0;
+			for (size_t i = 0; i < n; i++) {
+				const double e = cur[i] - (a * prev[i] + b);
+				rs += e * e;
+			}
+			res = std::sqrt(rs / n);
+		}
+
+		const double d = mc - mp;
+		m_FadeDiff.resize(n);
+		for (size_t i = 0; i < n; i++) {
+			m_FadeDiff[i] = cur[i] - prev[i];
+		}
+		const size_t mid = n / 2;
+		std::nth_element(m_FadeDiff.begin(), m_FadeDiff.begin() + mid, m_FadeDiff.end());
+		const double md = m_FadeDiff[mid];
+
+		const bool step = sp > FADE_MIN_STD
+			&& sc > FADE_MIN_STD * 0.7
+			&& res < FADE_RES_RATIO * sc + FADE_RES_ABS
+			&& std::fabs(d) > FADE_MIN_DELTA
+			&& std::fabs(a - 1.0) + std::fabs(b) > FADE_MIN_CHANGE
+			&& std::fabs(md) > FADE_MEDIAN_RATIO * std::fabs(d);
+		const int sign = d > 0 ? 1 : -1;
+
+		if (step && (m_FadeSign == 0 || sign == m_FadeSign)) {
+			m_FadeCount++;
+			m_FadeSign = sign;
+			m_FadeMiss = 0;
+		}
+		else if (step) {
+			m_FadeCount = 1;
+			m_FadeSign  = sign;
+			m_FadeMiss  = 0;
+		}
+		else {
+			m_FadeMiss++;
+			if (m_FadeMiss >= FADE_MAX_MISS) {
+				m_FadeCount   = 0;
+				m_FadeSign    = 0;
+				m_bFadeActive = false;
+			}
+		}
+		if (m_FadeCount >= FADE_NEED) {
+			m_bFadeActive = true;
+		}
+	}
+
+	m_FadePrevLuma.swap(m_FadeCurLuma);
+	m_FadePrevValid = true;
+}
+
 // Debanding at the source resolution, after the color conversion and before the scaling.
 // On success pInputTexture points to the debanded texture (same size as the input).
-HRESULT CDX11VideoProcessor::DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect)
+HRESULT CDX11VideoProcessor::DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect, const int strength)
 {
 	const UINT width  = pInputTexture->desc.Width;
 	const UINT height = pInputTexture->desc.Height;
@@ -3736,7 +3912,7 @@ HRESULT CDX11VideoProcessor::DebandPass(Tex2D_t*& pInputTexture, const CRect& sr
 		{3.5f / 255,  20.0f, 2}, // Medium
 		{6.0f / 255,  24.0f, 3}, // High
 	};
-	const Preset& preset = presets[std::clamp(m_iDebandStrength, 1, 3)];
+	const Preset& preset = presets[std::clamp(strength, 1, 3)];
 
 	// noise amplitude: about one code value of the intermediate texture
 	float grain = 0.5f / 255; // 16-bit float: the final pass dithers to the output depth
@@ -3784,7 +3960,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	Tex2D_t* pInputTexture = nullptr;
 
 	const UINT numSteps = GetPostScaleSteps();
-	const bool bDeband = IsDebandActive();
+	const bool bDebandAllowed = IsDebandActive();
 
 	if (m_D3D11VP.IsReady()) {
 		if (!(m_iSwapEffect == SWAPEFFECT_Discard && (m_VendorId == PCIV_AMDATI || m_VendorId == PCIV_INTEL))) {
@@ -3792,7 +3968,7 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 				(m_TexConvertOutput.desc.Width != dstRect.Width() || m_TexConvertOutput.desc.Height != dstRect.Height() || m_bFlip
 				|| dstRect.right > m_windowRect.right || dstRect.bottom > m_windowRect.bottom)
 				|| (m_bHdrPassthroughSupport && (m_bHdrPassthrough || m_bHdrLocalToneMapping)); // At least on Nvidia we can sometimes get the "D3D11: Removing Device" error here when HDR Passthrough.
-			if (!bNeedShaderTransform && !numSteps && !bDeband) {
+			if (!bNeedShaderTransform && !numSteps && !bDebandAllowed) {
 				m_bVPScalingUseShaders = false;
 				hr = D3D11VPPass(pRenderTarget, rSrc, dstRect, second);
 
@@ -3815,8 +3991,25 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		pInputTexture = &m_TexSrcVideo;
 	}
 
-	if (bDeband) {
-		DebandPass(pInputTexture, rSrc); // on failure the picture continues without debanding
+	if (bDebandAllowed) {
+		int debandStrength = m_iDebandStrength;
+
+		const bool detectFades = m_iDebandFadeStrength > 0 && m_iDebandFadeStrength != m_iDebandStrength;
+		if (detectFades) {
+			if (!second) { // once per source frame
+				UpdateFadeDetection(pInputTexture, rSrc);
+			}
+			if (m_bFadeActive) {
+				debandStrength = m_iDebandFadeStrength;
+			}
+		}
+		else if (m_FadeFrame || m_bFadeActive) {
+			ResetFadeDetection();
+		}
+
+		if (debandStrength > DEBAND_Off) {
+			DebandPass(pInputTexture, rSrc, debandStrength); // on failure the picture continues without debanding
+		}
 	}
 
 	if (numSteps) {
@@ -4381,7 +4574,8 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeVP = true; // the linear-light mode needs the shader video processor
 	}
 
-	m_iDebandStrength = config.iDebandStrength; // takes effect on the next rendered frame
+	m_iDebandStrength     = config.iDebandStrength; // takes effect on the next rendered frame
+	m_iDebandFadeStrength = config.iDebandFadeStrength;
 
 	if (config.iChromaScaling != m_iChromaScaling) {
 		m_iChromaScaling = config.iChromaScaling;
