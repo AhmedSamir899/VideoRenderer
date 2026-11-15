@@ -149,6 +149,9 @@
     <ClInclude Include="DX11VideoProcessor.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="FadeDetector.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="FrameStats.h">
       <Filter>Header Files</Filter>
     </ClInclude>

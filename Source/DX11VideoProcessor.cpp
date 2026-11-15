@@ -704,6 +704,7 @@ void CDX11VideoProcessor::ReleaseVP()
 		tex.Release();
 	}
 	ResetFadeDetection();
+	ReleaseDebandTimer();
 	m_TexsPostScale.Release();
 
 	m_PSConvColorData.Release();
@@ -3727,41 +3728,27 @@ bool CDX11VideoProcessor::IsDebandActive() const
 }
 
 // Fade detection. A small copy of every frame is read back (two frames later, so the GPU is never waited for)
-// and compared with the previous one. In a fade in/out or to/from white, the new frame is the old one with a
-// changed brightness: every pixel follows new = a * old + b with a small error, the mean brightness moves in one
-// direction and most pixels move with it. Scene cuts, camera motion and moving objects do not fit this.
-static constexpr UINT  FADE_W            = 128;
-static constexpr UINT  FADE_H            = 72;
-static constexpr float FADE_MIN_STD      = 0.012f; // the picture needs some content (standard deviation of the luma)
-static constexpr float FADE_RES_RATIO    = 0.25f;  // allowed error of the fit relative to the picture contrast
-static constexpr float FADE_RES_ABS      = 0.004f; // ... plus this much (noise)
-static constexpr float FADE_MIN_DELTA    = 0.0004f; // minimal change of the mean luma between frames
-static constexpr float FADE_MIN_CHANGE   = 0.004f; // minimal |a - 1| + |b|
-static constexpr float FADE_MEDIAN_RATIO = 0.3f;   // the median change must follow the mean change (global change)
-static constexpr int   FADE_NEED         = 3;      // consecutive matching frames to start
-static constexpr int   FADE_MAX_MISS     = 2;      // consecutive non matching frames to stop
-
+// and given to the detector, see FadeDetector.h.
 void CDX11VideoProcessor::ResetFadeDetection()
 {
-	m_FadeFrame     = 0;
-	m_FadePrevValid = false;
-	m_FadeCount     = 0;
-	m_FadeSign      = 0;
-	m_FadeMiss      = 0;
-	m_bFadeActive   = false;
+	m_FadeFrame = 0;
+	m_FadeDetector.Reset();
 }
 
 void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect)
 {
-	HRESULT hr = m_TexFadeSmall.CheckCreate(m_pDevice, DXGI_FORMAT_B8G8R8A8_UNORM, FADE_W, FADE_H, Tex2D_DefaultShaderRTarget);
+	constexpr UINT W = CFadeDetector::WIDTH;
+	constexpr UINT H = CFadeDetector::HEIGHT;
+
+	HRESULT hr = m_TexFadeSmall.CheckCreate(m_pDevice, DXGI_FORMAT_B8G8R8A8_UNORM, W, H, Tex2D_DefaultShaderRTarget);
 	if (FAILED(hr)) {
 		return;
 	}
 
 	if (!m_pFadeStaging[0]) {
 		D3D11_TEXTURE2D_DESC desc = {};
-		desc.Width            = FADE_W;
-		desc.Height           = FADE_H;
+		desc.Width            = W;
+		desc.Height           = H;
 		desc.MipLevels        = 1;
 		desc.ArraySize        = 1;
 		desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -3778,7 +3765,7 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 		}
 	}
 
-	hr = TextureCopyRect(*pInputTexture, m_TexFadeSmall.pTexture, srcRect, CRect(0, 0, FADE_W, FADE_H), m_pPS_Simple, nullptr, 0, false);
+	hr = TextureCopyRect(*pInputTexture, m_TexFadeSmall.pTexture, srcRect, CRect(0, 0, W, H), m_pPS_Simple, nullptr, 0, false);
 	if (FAILED(hr)) {
 		return;
 	}
@@ -3793,16 +3780,15 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFadeStaging[m_FadeFrame % 3], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mr);
 	if (hr != S_OK) {
-		m_FadePrevValid = false; // not ready: the sequence of frames is broken
+		m_FadeDetector.BreakSequence(); // not ready: the sequence of frames is broken
 		return;
 	}
 
-	constexpr size_t n = (size_t)FADE_W * FADE_H;
-	m_FadeCurLuma.resize(n);
-	for (UINT y = 0; y < FADE_H; y++) {
+	m_FadeLuma.resize(CFadeDetector::COUNT);
+	for (UINT y = 0; y < H; y++) {
 		const BYTE* row = (const BYTE*)mr.pData + (size_t)y * mr.RowPitch;
-		float* dst = &m_FadeCurLuma[(size_t)y * FADE_W];
-		for (UINT x = 0; x < FADE_W; x++) {
+		float* dst = &m_FadeLuma[(size_t)y * W];
+		for (UINT x = 0; x < W; x++) {
 			const float b = row[4 * x + 0];
 			const float g = row[4 * x + 1];
 			const float r = row[4 * x + 2];
@@ -3811,86 +3797,77 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 	}
 	m_pDeviceContext->Unmap(m_pFadeStaging[m_FadeFrame % 3], 0);
 
-	if (m_FadePrevValid && m_FadePrevLuma.size() == n) {
-		const std::vector<float>& prev = m_FadePrevLuma;
-		const std::vector<float>& cur  = m_FadeCurLuma;
+	m_FadeDetector.Update(m_FadeLuma.data());
+}
 
-		double mp = 0, mc = 0;
-		for (size_t i = 0; i < n; i++) {
-			mp += prev[i];
-			mc += cur[i];
-		}
-		mp /= n;
-		mc /= n;
+// GPU time of the passes above and the debanding, only measured while the statistics are shown.
+void CDX11VideoProcessor::StartDebandTimer()
+{
+	if (m_QueryPending >= std::size(m_pQDisjoint)) {
+		return; // all sets are still in flight
+	}
 
-		double vp = 0, vc = 0, cov = 0;
-		for (size_t i = 0; i < n; i++) {
-			const double dp = prev[i] - mp;
-			const double dc = cur[i] - mc;
-			vp  += dp * dp;
-			vc  += dc * dc;
-			cov += dp * dc;
-		}
-		vp /= n;
-		vc /= n;
-		cov /= n;
-		const double sp = std::sqrt(vp);
-		const double sc = std::sqrt(vc);
-
-		double a = 1.0, b = 0.0, res = 1.0;
-		if (vp > 1e-9) {
-			a = cov / vp;
-			b = mc - a * mp;
-			double rs = 0;
-			for (size_t i = 0; i < n; i++) {
-				const double e = cur[i] - (a * prev[i] + b);
-				rs += e * e;
-			}
-			res = std::sqrt(rs / n);
-		}
-
-		const double d = mc - mp;
-		m_FadeDiff.resize(n);
-		for (size_t i = 0; i < n; i++) {
-			m_FadeDiff[i] = cur[i] - prev[i];
-		}
-		const size_t mid = n / 2;
-		std::nth_element(m_FadeDiff.begin(), m_FadeDiff.begin() + mid, m_FadeDiff.end());
-		const double md = m_FadeDiff[mid];
-
-		const bool step = sp > FADE_MIN_STD
-			&& sc > FADE_MIN_STD * 0.7
-			&& res < FADE_RES_RATIO * sc + FADE_RES_ABS
-			&& std::fabs(d) > FADE_MIN_DELTA
-			&& std::fabs(a - 1.0) + std::fabs(b) > FADE_MIN_CHANGE
-			&& std::fabs(md) > FADE_MEDIAN_RATIO * std::fabs(d);
-		const int sign = d > 0 ? 1 : -1;
-
-		if (step && (m_FadeSign == 0 || sign == m_FadeSign)) {
-			m_FadeCount++;
-			m_FadeSign = sign;
-			m_FadeMiss = 0;
-		}
-		else if (step) {
-			m_FadeCount = 1;
-			m_FadeSign  = sign;
-			m_FadeMiss  = 0;
-		}
-		else {
-			m_FadeMiss++;
-			if (m_FadeMiss >= FADE_MAX_MISS) {
-				m_FadeCount   = 0;
-				m_FadeSign    = 0;
-				m_bFadeActive = false;
-			}
-		}
-		if (m_FadeCount >= FADE_NEED) {
-			m_bFadeActive = true;
+	if (!m_pQDisjoint[m_QueryWrite]) {
+		for (UINT i = 0; i < std::size(m_pQDisjoint); i++) {
+			D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+			if (FAILED(m_pDevice->CreateQuery(&qd, &m_pQDisjoint[i]))) { return; }
+			qd.Query = D3D11_QUERY_TIMESTAMP;
+			if (FAILED(m_pDevice->CreateQuery(&qd, &m_pQStart[i])) || FAILED(m_pDevice->CreateQuery(&qd, &m_pQEnd[i]))) { return; }
 		}
 	}
 
-	m_FadePrevLuma.swap(m_FadeCurLuma);
-	m_FadePrevValid = true;
+	m_pDeviceContext->Begin(m_pQDisjoint[m_QueryWrite]);
+	m_pDeviceContext->End(m_pQStart[m_QueryWrite]);
+	m_bDebandTimerOpen = true;
+}
+
+void CDX11VideoProcessor::StopDebandTimer()
+{
+	if (!m_bDebandTimerOpen) {
+		return;
+	}
+	m_bDebandTimerOpen = false;
+
+	m_pDeviceContext->End(m_pQEnd[m_QueryWrite]);
+	m_pDeviceContext->End(m_pQDisjoint[m_QueryWrite]);
+	m_QueryWrite = (m_QueryWrite + 1) % std::size(m_pQDisjoint);
+	m_QueryPending++;
+}
+
+void CDX11VideoProcessor::CollectDebandTimer()
+{
+	while (m_QueryPending) {
+		const UINT r = m_QueryRead;
+
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+		if (S_OK != m_pDeviceContext->GetData(m_pQDisjoint[r], &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH)) {
+			break; // not ready yet
+		}
+
+		UINT64 t0 = 0, t1 = 0;
+		if (S_OK == m_pDeviceContext->GetData(m_pQStart[r], &t0, sizeof(t0), D3D11_ASYNC_GETDATA_DONOTFLUSH)
+				&& S_OK == m_pDeviceContext->GetData(m_pQEnd[r], &t1, sizeof(t1), D3D11_ASYNC_GETDATA_DONOTFLUSH)
+				&& !dj.Disjoint && dj.Frequency && t1 >= t0) {
+			const float ms = (float)((double)(t1 - t0) * 1000.0 / (double)dj.Frequency);
+			m_DebandGpuMs = m_DebandTimed ? m_DebandGpuMs * 0.9f + ms * 0.1f : ms;
+			m_DebandTimed = true;
+		}
+
+		m_QueryRead = (r + 1) % std::size(m_pQDisjoint);
+		m_QueryPending--;
+	}
+}
+
+void CDX11VideoProcessor::ReleaseDebandTimer()
+{
+	for (UINT i = 0; i < std::size(m_pQDisjoint); i++) {
+		m_pQDisjoint[i].Release();
+		m_pQStart[i].Release();
+		m_pQEnd[i].Release();
+	}
+	m_QueryWrite = m_QueryRead = m_QueryPending = 0;
+	m_bDebandTimerOpen = false;
+	m_DebandTimed = false;
 }
 
 // Debanding at the source resolution, after the color conversion and before the scaling.
@@ -3994,21 +3971,30 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 	if (bDebandAllowed) {
 		int debandStrength = m_iDebandStrength;
 
+		if (m_bShowStats) {
+			StartDebandTimer();
+		}
+
 		const bool detectFades = m_iDebandFadeStrength > 0 && m_iDebandFadeStrength != m_iDebandStrength;
 		if (detectFades) {
 			if (!second) { // once per source frame
 				UpdateFadeDetection(pInputTexture, rSrc);
 			}
-			if (m_bFadeActive) {
+			if (m_FadeDetector.IsActive()) {
 				debandStrength = m_iDebandFadeStrength;
 			}
 		}
-		else if (m_FadeFrame || m_bFadeActive) {
+		else if (m_FadeFrame || m_FadeDetector.IsActive()) {
 			ResetFadeDetection();
 		}
 
 		if (debandStrength > DEBAND_Off) {
 			DebandPass(pInputTexture, rSrc, debandStrength); // on failure the picture continues without debanding
+		}
+
+		StopDebandTimer();
+		if (m_bShowStats) {
+			CollectDebandTimer();
 		}
 	}
 
@@ -5172,6 +5158,22 @@ HRESULT CDX11VideoProcessor::DrawStats(ID3D11Texture2D* pRenderTarget)
 			str.append(L" dither");
 		}
 		str_trim_end(str, ',');
+	}
+	if (m_iDebandStrength > DEBAND_Off || m_iDebandFadeStrength > 0) {
+		static const wchar_t* const names[] = { L"Off", L"Low", L"Medium", L"High" };
+		str += std::format(L"\nDebanding     : {}", names[std::clamp(m_iDebandStrength, 0, 3)]);
+		if (m_iDebandFadeStrength > 0 && m_iDebandFadeStrength != m_iDebandStrength) {
+			str += std::format(L", fades {}", names[std::clamp(m_iDebandFadeStrength, 0, 3)]);
+			if (m_FadeDetector.IsActive()) {
+				str.append(L" [fade detected]");
+			}
+		}
+		if (!IsDebandActive()) {
+			str.append(L" (not used for this video)");
+		}
+		else if (m_DebandTimed) {
+			str += std::format(L", GPU {:.2f} ms", m_DebandGpuMs);
+		}
 	}
 	str.append(m_strStatsHDR);
 	if ((m_bSdrMeasureActive || m_bHdrLocalMeasureActive) && m_fHdrMeasuredPeakNits > 0.0f) {

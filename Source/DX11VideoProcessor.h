@@ -32,8 +32,10 @@
 #include "D3DUtil/D3D11Geometry.h"
 #include "VideoProcessor.h"
 #include "SubPic/DX11SubPic.h"
+#include "FadeDetector.h"
 
 #include <atomic>
+#include <vector>
 
 #define TEST_SHADER 0
 
@@ -73,15 +75,20 @@ private:
 	Tex2D_t m_TexDeband;        // result of the debanding pass
 	Tex2D_t m_TexFadeSmall;     // small copy of the frame for the fade detection
 	CComPtr<ID3D11Texture2D> m_pFadeStaging[3]; // CPU readable copies, read two frames later to avoid stalling the GPU
-	std::vector<float> m_FadePrevLuma;
-	std::vector<float> m_FadeCurLuma;
-	std::vector<float> m_FadeDiff;
+	std::vector<float> m_FadeLuma; // luma of the copy that was read back
 	UINT m_FadeFrame      = 0;
-	bool m_FadePrevValid  = false;
-	int  m_FadeCount      = 0;
-	int  m_FadeSign       = 0;
-	int  m_FadeMiss       = 0;
-	bool m_bFadeActive    = false;
+	CFadeDetector m_FadeDetector;
+
+	// GPU time of the fade detection and debanding passes, measured only while the statistics are shown
+	CComPtr<ID3D11Query> m_pQDisjoint[4];
+	CComPtr<ID3D11Query> m_pQStart[4];
+	CComPtr<ID3D11Query> m_pQEnd[4];
+	UINT  m_QueryWrite    = 0;
+	UINT  m_QueryRead     = 0;
+	UINT  m_QueryPending  = 0;
+	bool  m_bDebandTimerOpen = false;
+	bool  m_DebandTimed   = false;
+	float m_DebandGpuMs   = 0.0f;
 	CTex2DRing m_TexsPostScale;
 	Tex2D_t m_TexDither;
 
@@ -410,6 +417,10 @@ private:
 	HRESULT DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect, const int strength);
 	void ResetFadeDetection();
 	void UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect);
+	void StartDebandTimer();
+	void StopDebandTimer();
+	void CollectDebandTimer();
+	void ReleaseDebandTimer();
 	HRESULT ResizeShaderPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect, const int rotation);
 	HRESULT FinalPass(const Tex2D_t& Tex, ID3D11Texture2D* pRenderTarget, const CRect& srcRect, const CRect& dstRect);
 
