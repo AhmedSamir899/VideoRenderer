@@ -382,7 +382,8 @@ HRESULT CVRMainPPage::OnActivate()
 		L"Debanding strength while a fade in/out is detected.\n"
 		L"Fades make banding most visible. 'Same' uses the normal strength\n"
 		L"and turns the fade detection off.\n"
-		L"The detection needs about 3 frames to react. Direct3D 11 only.");
+		L"The detection needs about 7 frames to react (about 0.3 s at 24 fps).\n"
+		L"Direct3D 11 only.");
 	AddHint(IDC_COMBO2,
 		L"Used to increase image size when the\n"
 		"DVXA2/D3D11 Video Processor is not used for resizing.");

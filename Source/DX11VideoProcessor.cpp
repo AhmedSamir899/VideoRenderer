@@ -130,6 +130,11 @@ struct PS_DEBAND_CONSTANTS {
 	float pad[3];
 };
 
+struct PS_FADE_CONSTANTS {
+	float cell[4];  // x0, y0, cell width, cell height (source pixels)
+	float limit[4]; // last pixel x, y (inclusive)
+};
+
 struct PS_EXTSHADER_CONSTANTS {
 	DirectX::XMFLOAT2 pxy; // pixel size in normalized coordinates
 	DirectX::XMFLOAT2 wh;  // width and height of texture
@@ -772,6 +777,8 @@ void CDX11VideoProcessor::ReleaseDevice()
 	m_pPS_Simple.Release();
 	m_pPSDeband.Release();
 	m_pDebandConstants.Release();
+	m_pPSFadeDown.Release();
+	m_pFadeConstants.Release();
 	m_pPS_BitmapToFrame.Release();
 	m_pSamplerPoint.Release();
 	m_pSamplerLinear.Release();
@@ -1663,6 +1670,7 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPS_Simple, IDF_PS_11_SIMPLE));
 	CreatePShaderFromResource(&m_pPSDeband, IDF_PS_11_DEBAND); // optional: without it the debanding stays off
+	CreatePShaderFromResource(&m_pPSFadeDown, IDF_PS_11_FADE_DOWNSAMPLE);
 
 #if TEST_SHADER
 	EXECUTE_ASSERT(S_OK == CreatePShaderFromResource(&m_pPS_TEST, IDF_PS_11_TEST));
@@ -1683,6 +1691,8 @@ HRESULT CDX11VideoProcessor::SetDevice(ID3D11Device *pDevice, ID3D11DeviceContex
 
 	BufferDesc = { sizeof(PS_DEBAND_CONSTANTS), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
 	m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pDebandConstants);
+	BufferDesc = { sizeof(PS_FADE_CONSTANTS), D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_WRITE, 0, 0 };
+	m_pDevice->CreateBuffer(&BufferDesc, nullptr, &m_pFadeConstants);
 
 	CComPtr<IDXGIFactory1> pDXGIFactory1;
 	hr = pDXGIAdapter->GetParent(IID_PPV_ARGS(&pDXGIFactory1));
@@ -2179,8 +2189,11 @@ BOOL CDX11VideoProcessor::InitMediaType(const CMediaType* pmt)
 	if (m_srcExFmt.VideoTransferMatrix == VIDEOTRANSFERMATRIX_YCgCo || m_Dovi.bValid) {
 		disableD3D11VP = true;
 	}
-	if (m_iSaturationMode >= SATMODE_LinearLight && FmtParams.DX11Format != DXGI_FORMAT_UNKNOWN) {
-		// the video processor applies saturation in the driver, so the shader video processor is needed
+	if ((m_iSaturationMode >= SATMODE_LinearLight || m_iDebandStrength > DEBAND_Off || m_iDebandFadeStrength > 0)
+			&& FmtParams.DX11Format != DXGI_FORMAT_UNKNOWN) {
+		// The video processor applies saturation in the driver. For the debanding it would scale the picture to the
+		// window size (and for HDR keep the PQ encoding) before the debanding pass: the shader video processor
+		// gives the debanding the picture at the source size in SDR gamma values.
 		disableD3D11VP = true;
 	}
 	if (FmtParams.CSType == CS_RGB && m_VendorId == PCIV_NVIDIA) {
@@ -2526,6 +2539,7 @@ HRESULT CDX11VideoProcessor::ProcessSample(IMediaSample* pSample)
 	rtEnd = rtStart + rtFrameDur;
 
 	m_rtStart = rtStart;
+	m_SampleCounter++;
 	CRefTime rtClock(rtStart);
 
 	HRESULT hr = CopySample(pSample);
@@ -3731,16 +3745,23 @@ bool CDX11VideoProcessor::IsDebandActive() const
 // and given to the detector, see FadeDetector.h.
 void CDX11VideoProcessor::ResetFadeDetection()
 {
-	m_FadeFrame = 0;
+	m_FadeFrame     = 0;
+	m_FadeMapFails  = 0;
+	m_FadeSampleId  = UINT_MAX;
 	m_FadeDetector.Reset();
 }
 
-void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect)
+void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect, const double rateScale)
 {
+	if (!m_pPSFadeDown || !m_pFadeConstants) {
+		return;
+	}
+
 	constexpr UINT W = CFadeDetector::WIDTH;
 	constexpr UINT H = CFadeDetector::HEIGHT;
+	constexpr DXGI_FORMAT fmt = DXGI_FORMAT_R16_UNORM; // 16-bit luma: no 8-bit rounding of the small averaged differences
 
-	HRESULT hr = m_TexFadeSmall.CheckCreate(m_pDevice, DXGI_FORMAT_B8G8R8A8_UNORM, W, H, Tex2D_DefaultShaderRTarget);
+	HRESULT hr = m_TexFadeSmall.CheckCreate(m_pDevice, fmt, W, H, Tex2D_DefaultShaderRTarget);
 	if (FAILED(hr)) {
 		return;
 	}
@@ -3751,7 +3772,7 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 		desc.Height           = H;
 		desc.MipLevels        = 1;
 		desc.ArraySize        = 1;
-		desc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+		desc.Format           = fmt;
 		desc.SampleDesc.Count = 1;
 		desc.Usage            = D3D11_USAGE_STAGING;
 		desc.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
@@ -3765,7 +3786,20 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 		}
 	}
 
-	hr = TextureCopyRect(*pInputTexture, m_TexFadeSmall.pTexture, srcRect, CRect(0, 0, W, H), m_pPS_Simple, nullptr, 0, false);
+	// every pixel of the small copy averages the cell of the picture it covers
+	const PS_FADE_CONSTANTS constants = {
+		{ (float)srcRect.left, (float)srcRect.top, (float)srcRect.Width() / W, (float)srcRect.Height() / H },
+		{ (float)(srcRect.right - 1), (float)(srcRect.bottom - 1), 0.0f, 0.0f }
+	};
+	D3D11_MAPPED_SUBRESOURCE mrc;
+	hr = m_pDeviceContext->Map(m_pFadeConstants, 0, D3D11_MAP_WRITE_DISCARD, 0, &mrc);
+	if (FAILED(hr)) {
+		return;
+	}
+	memcpy(mrc.pData, &constants, sizeof(constants));
+	m_pDeviceContext->Unmap(m_pFadeConstants, 0);
+
+	hr = TextureCopyRect(*pInputTexture, m_TexFadeSmall.pTexture, srcRect, CRect(0, 0, W, H), m_pPSFadeDown, m_pFadeConstants, 0, false);
 	if (FAILED(hr)) {
 		return;
 	}
@@ -3780,24 +3814,26 @@ void CDX11VideoProcessor::UpdateFadeDetection(Tex2D_t* pInputTexture, const CRec
 	D3D11_MAPPED_SUBRESOURCE mr;
 	hr = m_pDeviceContext->Map(m_pFadeStaging[m_FadeFrame % 3], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mr);
 	if (hr != S_OK) {
-		m_FadeDetector.BreakSequence(); // not ready: the sequence of frames is broken
+		// not ready: the sequence of frames is broken. If the GPU stays busy for a while, forget the state.
+		m_FadeDetector.BreakSequence();
+		if (++m_FadeMapFails >= 6) {
+			m_FadeDetector.Reset();
+		}
 		return;
 	}
+	m_FadeMapFails = 0;
 
 	m_FadeLuma.resize(CFadeDetector::COUNT);
 	for (UINT y = 0; y < H; y++) {
-		const BYTE* row = (const BYTE*)mr.pData + (size_t)y * mr.RowPitch;
+		const uint16_t* row = (const uint16_t*)((const BYTE*)mr.pData + (size_t)y * mr.RowPitch);
 		float* dst = &m_FadeLuma[(size_t)y * W];
 		for (UINT x = 0; x < W; x++) {
-			const float b = row[4 * x + 0];
-			const float g = row[4 * x + 1];
-			const float r = row[4 * x + 2];
-			dst[x] = (0.2126f * r + 0.7152f * g + 0.0722f * b) / 255.0f;
+			dst[x] = row[x] * (1.0f / 65535.0f);
 		}
 	}
 	m_pDeviceContext->Unmap(m_pFadeStaging[m_FadeFrame % 3], 0);
 
-	m_FadeDetector.Update(m_FadeLuma.data());
+	m_FadeDetector.Update(m_FadeLuma.data(), rateScale);
 }
 
 // GPU time of the passes above and the debanding, only measured while the statistics are shown.
@@ -3977,8 +4013,17 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 
 		const bool detectFades = m_iDebandFadeStrength > 0 && m_iDebandFadeStrength != m_iDebandStrength;
 		if (detectFades) {
-			if (!second) { // once per source frame
-				UpdateFadeDetection(pInputTexture, rSrc);
+			// once per received frame: not for the second field, and not when the same frame is drawn again
+			// (the window is resized, a screenshot is taken, the video is paused)
+			if (!second && m_FadeSampleId != m_SampleCounter) {
+				m_FadeSampleId = m_SampleCounter;
+
+				// a fade moves less per frame at a high frame rate: 1 up to 24 fps, 0.5 from 48 fps
+				double rateScale = 1.0;
+				if (m_rtAvgTimePerFrame > 0) {
+					rateScale = std::clamp(m_rtAvgTimePerFrame * 24.0 / UNITS, 0.5, 1.0);
+				}
+				UpdateFadeDetection(pInputTexture, rSrc, rateScale);
 			}
 			if (m_FadeDetector.IsActive()) {
 				debandStrength = m_iDebandFadeStrength;
@@ -3996,6 +4041,9 @@ HRESULT CDX11VideoProcessor::Process(ID3D11Texture2D* pRenderTarget, const CRect
 		if (m_bShowStats) {
 			CollectDebandTimer();
 		}
+	}
+	else if (m_FadeFrame || m_FadeDetector.IsActive()) {
+		ResetFadeDetection(); // the debanding is off: nothing stale for later
 	}
 
 	if (numSteps) {
@@ -4560,7 +4608,11 @@ void CDX11VideoProcessor::Configure(const Settings_t& config)
 		changeVP = true; // the linear-light mode needs the shader video processor
 	}
 
-	m_iDebandStrength     = config.iDebandStrength; // takes effect on the next rendered frame
+	// the debanding needs the shader video processor, so switching it on or off re-initialises the media type
+	if ((config.iDebandStrength > DEBAND_Off || config.iDebandFadeStrength > 0) != (m_iDebandStrength > DEBAND_Off || m_iDebandFadeStrength > 0)) {
+		changeVP = true;
+	}
+	m_iDebandStrength     = config.iDebandStrength; // other changes take effect on the next rendered frame
 	m_iDebandFadeStrength = config.iDebandFadeStrength;
 
 	if (config.iChromaScaling != m_iChromaScaling) {
@@ -4797,6 +4849,7 @@ void CDX11VideoProcessor::Flush()
 	}
 
 	m_rtStart = 0;
+	ResetFadeDetection();
 
 	m_DoviExtensionMetadata = {};
 	m_lastDoViDynamicConstantsBuffer = {};

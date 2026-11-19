@@ -77,6 +77,9 @@ private:
 	CComPtr<ID3D11Texture2D> m_pFadeStaging[3]; // CPU readable copies, read two frames later to avoid stalling the GPU
 	std::vector<float> m_FadeLuma; // luma of the copy that was read back
 	UINT m_FadeFrame      = 0;
+	int  m_FadeMapFails   = 0;
+	UINT m_SampleCounter  = 0;          // counts the decoded frames that were received
+	UINT m_FadeSampleId   = UINT_MAX;   // the frame the fade detection has seen last: a redraw of it is not a new frame
 	CFadeDetector m_FadeDetector;
 
 	// GPU time of the fade detection and debanding passes, measured only while the statistics are shown
@@ -106,6 +109,8 @@ private:
 	CComPtr<ID3D11PixelShader> m_pPSCorrection;
 	CComPtr<ID3D11PixelShader> m_pPSDeband;
 	CComPtr<ID3D11Buffer>      m_pDebandConstants;
+	CComPtr<ID3D11PixelShader> m_pPSFadeDown;
+	CComPtr<ID3D11Buffer>      m_pFadeConstants;
 	UINT m_DebandFrame = 0;
 
 	// per-frame measurement of the content peak, for the HDR to SDR conversion and local tone mapping
@@ -416,7 +421,7 @@ private:
 	bool IsDebandActive() const;
 	HRESULT DebandPass(Tex2D_t*& pInputTexture, const CRect& srcRect, const int strength);
 	void ResetFadeDetection();
-	void UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect);
+	void UpdateFadeDetection(Tex2D_t* pInputTexture, const CRect& srcRect, const double rateScale);
 	void StartDebandTimer();
 	void StopDebandTimer();
 	void CollectDebandTimer();

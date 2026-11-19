@@ -46,6 +46,8 @@ public:
 	static constexpr float MIN_DELTA    = 0.0004f; // minimal change of the mean luma between two frames
 	static constexpr float MIN_CHANGE   = 0.004f;  // minimal |a - 1| + |b|
 	static constexpr float MEDIAN_RATIO = 0.3f;    // the median change must follow the mean change (global change)
+	static constexpr float MEDIAN_ACTIVE = 0.004f; // ... counted over the pixels that are not black in both frames (letterbox bars)
+	static constexpr size_t MEDIAN_MIN_COUNT = 1000; // fewer such pixels: there is no picture to judge
 	static constexpr float QUAD_MIN_PRED = 0.0003f; // a quadrant counts when the fit predicts at least this mean change
 	static constexpr float QUAD_LO       = 0.4f;    // the real mean change of a quadrant must be within
 	static constexpr float QUAD_HI       = 1.8f;    // [LO, HI] times the predicted one
@@ -64,12 +66,17 @@ public:
 	}
 
 	// the next frame does not follow the previous one (a frame was not available)
-	void BreakSequence() { m_havePrev = false; }
+	void BreakSequence()
+	{
+		m_havePrev  = false;
+		m_haveLastD = false;
+	}
 
 	bool IsActive() const { return m_active; }
 
 	// luma: COUNT values in the range 0..1 of the next frame. Returns true while a fade is active.
-	bool Update(const float* luma)
+	// rateScale (0.5 .. 1): 1 for 24 fps and slower, smaller for faster video, where a fade moves less per frame.
+	bool Update(const float* luma, double rateScale = 1.0)
 	{
 		if (m_cur.size() != COUNT) {
 			m_cur.resize(COUNT);
@@ -142,18 +149,26 @@ public:
 			}
 			const bool quadOk = valid >= 2 && good * 4 >= valid * 3;
 
+			// median change over the pixels that are not black in both frames: black bars and the black of a dark
+			// picture do not change and would put the median at zero
+			size_t cnt = 0;
 			for (size_t i = 0; i < n; i++) {
-				m_diff[i] = m_cur[i] - m_prev[i];
+				if (std::max(m_prev[i], m_cur[i]) > MEDIAN_ACTIVE) {
+					m_diff[cnt++] = m_cur[i] - m_prev[i];
+				}
 			}
-			const size_t mid = n / 2;
-			std::nth_element(m_diff.begin(), m_diff.begin() + mid, m_diff.end());
-			const double md = m_diff[mid];
+			double md = 0.0;
+			if (cnt >= MEDIAN_MIN_COUNT) {
+				const size_t mid = cnt / 2;
+				std::nth_element(m_diff.begin(), m_diff.begin() + mid, m_diff.begin() + cnt);
+				md = m_diff[mid];
+			}
 
 			bool step = sp > MIN_STD
 				&& sc > MIN_STD * 0.7
 				&& res < RES_RATIO * sc + RES_ABS
-				&& std::fabs(d) > MIN_DELTA
-				&& std::fabs(a - 1.0) + std::fabs(b) > MIN_CHANGE
+				&& std::fabs(d) > MIN_DELTA * rateScale
+				&& std::fabs(a - 1.0) + std::fabs(b) > MIN_CHANGE * rateScale
 				&& std::fabs(md) > MEDIAN_RATIO * std::fabs(d)
 				&& quadOk;
 			const int sign = d > 0 ? 1 : -1;
